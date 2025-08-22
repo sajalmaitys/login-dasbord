@@ -1,5 +1,5 @@
 import express from 'express'
-import mongoose from 'mongoose'
+import mysql from 'mysql2/promise'
 import cors from 'cors'
 import bcrypt from 'bcryptjs'
 import dotenv from 'dotenv'
@@ -9,95 +9,98 @@ dotenv.config()
 const app = express()
 const PORT = process.env.PORT || 5000
 
-// Middleware
 app.use(cors())
 app.use(express.json())
 
-// MongoDB connection
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/dashboard'
+// MySQL connection
+const dbConfig = {
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '8332',
+  database: process.env.DB_NAME || 'dashboard'
+}
 
-mongoose.connect(MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err))
+let db
 
-// User Schema
-const userSchema = new mongoose.Schema({
-  fullName: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  phoneNumber: {
-    type: String,
-    required: true,
-    unique: true,
-    trim: true
-  },
-  password: {
-    type: String,
-    required: true,
-    minlength: 6
+async function initializeDatabase() {
+  try {
+    // First connect without specifying database to create it if needed
+    const tempConfig = { ...dbConfig }
+    delete tempConfig.database
+    
+    const tempDb = await mysql.createConnection(tempConfig)
+    
+    // Create database if it doesn't exist
+    await tempDb.execute(`CREATE DATABASE IF NOT EXISTS \`${dbConfig.database}\``)
+    await tempDb.end()
+    
+    // Now connect to the specific database
+    db = await mysql.createConnection(dbConfig)
+    console.log('Connected to MySQL database')
+
+    // Create tables if they don't exist
+    await createTables()
+  } catch (err) {
+    console.error('MySQL connection error:', err)
+    process.exit(1)
   }
-}, {
-  timestamps: true
-})
+}
 
-const User = mongoose.model('User', userSchema)
+async function createTables() {
+  try {
+    // Create users table
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS users (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        fullName VARCHAR(255) NOT NULL,
+        phoneNumber VARCHAR(20) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `)
 
-// Idea Schema
-const ideaSchema = new mongoose.Schema({
-  text: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  project: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  module: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  section: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  submittedBy: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  userId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: true
-  },
-  status: {
-    type: String,
-    enum: ['pending', 'approved', 'rejected', 'in-progress', 'completed'],
-    default: 'pending'
+    // Create ideas table
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS ideas (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        text TEXT NOT NULL,
+        project VARCHAR(255) NOT NULL,
+        module VARCHAR(255) NOT NULL,
+        section VARCHAR(255) NOT NULL,
+        submittedBy VARCHAR(255) NOT NULL,
+        userId INT NOT NULL,
+        status ENUM('pending', 'approved', 'rejected', 'in-progress', 'completed') DEFAULT 'pending',
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      )
+    `)
+
+    console.log('Database tables created successfully')
+  } catch (error) {
+    console.error('Error creating tables:', error)
   }
-}, {
-  timestamps: true
-})
+}
 
-const Idea = mongoose.model('Idea', ideaSchema)
 
-// Routes
+
+
+
 app.post('/api/register', async (req, res) => {
   try {
     const { fullName, phoneNumber, password } = req.body
 
     // Check if user already exists
-    const existingUser = await User.findOne({ phoneNumber })
-    if (existingUser) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'User with this phone number already exists' 
+    const [existingUsers] = await db.execute(
+      'SELECT id FROM users WHERE phoneNumber = ?',
+      [phoneNumber]
+    )
+
+    if (existingUsers.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'User with this phone number already exists'
       })
     }
 
@@ -105,22 +108,19 @@ app.post('/api/register', async (req, res) => {
     const saltRounds = 10
     const hashedPassword = await bcrypt.hash(password, saltRounds)
 
-    // Create new user
-    const newUser = new User({
-      fullName,
-      phoneNumber,
-      password: hashedPassword
-    })
-
-    await newUser.save()
+    // Insert new user
+    const [result] = await db.execute(
+      'INSERT INTO users (fullName, phoneNumber, password) VALUES (?, ?, ?)',
+      [fullName, phoneNumber, hashedPassword]
+    )
 
     res.status(201).json({
       success: true,
       message: 'User registered successfully',
       user: {
-        id: newUser._id,
-        fullName: newUser.fullName,
-        phoneNumber: newUser.phoneNumber
+        id: result.insertId,
+        fullName,
+        phoneNumber
       }
     })
 
@@ -138,15 +138,21 @@ app.post('/api/login', async (req, res) => {
     const { phoneNumber, password } = req.body
 
     // Find user by phone number
-    const user = await User.findOne({ phoneNumber })
-    if (!user) {
+    const [users] = await db.execute(
+      'SELECT id, fullName, phoneNumber, password FROM users WHERE phoneNumber = ?',
+      [phoneNumber]
+    )
+
+    if (users.length === 0) {
       return res.status(400).json({
         success: false,
         message: 'Invalid phone number or password'
       })
     }
 
-    // Check password
+    const user = users[0]
+
+    // Verify password
     const isPasswordValid = await bcrypt.compare(password, user.password)
     if (!isPasswordValid) {
       return res.status(400).json({
@@ -159,7 +165,7 @@ app.post('/api/login', async (req, res) => {
       success: true,
       message: 'Login successful',
       user: {
-        id: user._id,
+        id: user.id,
         fullName: user.fullName,
         phoneNumber: user.phoneNumber
       }
@@ -174,7 +180,7 @@ app.post('/api/login', async (req, res) => {
   }
 })
 
-// Submit idea
+
 app.post('/api/ideas', async (req, res) => {
   try {
     const { text, project, module, section, submittedBy, userId } = req.body
@@ -187,22 +193,22 @@ app.post('/api/ideas', async (req, res) => {
       })
     }
 
-    // Create new idea
-    const newIdea = new Idea({
-      text,
-      project,
-      module,
-      section,
-      submittedBy,
-      userId
-    })
+    // Insert new idea
+    const [result] = await db.execute(
+      'INSERT INTO ideas (text, project, module, section, submittedBy, userId) VALUES (?, ?, ?, ?, ?, ?)',
+      [text, project, module, section, submittedBy, userId]
+    )
 
-    await newIdea.save()
+    // Get the created idea
+    const [ideas] = await db.execute(
+      'SELECT * FROM ideas WHERE id = ?',
+      [result.insertId]
+    )
 
     res.status(201).json({
       success: true,
       message: 'Idea submitted successfully',
-      idea: newIdea
+      idea: ideas[0]
     })
 
   } catch (error) {
@@ -214,10 +220,16 @@ app.post('/api/ideas', async (req, res) => {
   }
 })
 
-// Get all ideas
+
 app.get('/api/ideas', async (req, res) => {
   try {
-    const ideas = await Idea.find().populate('userId', 'fullName phoneNumber').sort({ createdAt: -1 })
+    const [ideas] = await db.execute(`
+      SELECT i.*, u.fullName, u.phoneNumber 
+      FROM ideas i 
+      LEFT JOIN users u ON i.userId = u.id 
+      ORDER BY i.createdAt DESC
+    `)
+
     res.json({
       success: true,
       ideas
@@ -231,11 +243,15 @@ app.get('/api/ideas', async (req, res) => {
   }
 })
 
-// Get ideas by user
+
 app.get('/api/ideas/user/:userId', async (req, res) => {
   try {
     const { userId } = req.params
-    const ideas = await Idea.find({ userId }).sort({ createdAt: -1 })
+    const [ideas] = await db.execute(
+      'SELECT * FROM ideas WHERE userId = ? ORDER BY createdAt DESC',
+      [userId]
+    )
+
     res.json({
       success: true,
       ideas
@@ -249,7 +265,7 @@ app.get('/api/ideas/user/:userId', async (req, res) => {
   }
 })
 
-// Update idea status
+
 app.patch('/api/ideas/:id/status', async (req, res) => {
   try {
     const { id } = req.params
@@ -263,23 +279,29 @@ app.patch('/api/ideas/:id/status', async (req, res) => {
       })
     }
 
-    const idea = await Idea.findByIdAndUpdate(
-      id,
-      { status },
-      { new: true }
+    // Update idea status
+    const [result] = await db.execute(
+      'UPDATE ideas SET status = ? WHERE id = ?',
+      [status, id]
     )
 
-    if (!idea) {
+    if (result.affectedRows === 0) {
       return res.status(404).json({
         success: false,
         message: 'Idea not found'
       })
     }
 
+    // Get updated idea
+    const [ideas] = await db.execute(
+      'SELECT * FROM ideas WHERE id = ?',
+      [id]
+    )
+
     res.json({
       success: true,
       message: 'Idea status updated successfully',
-      idea
+      idea: ideas[0]
     })
 
   } catch (error) {
@@ -291,10 +313,13 @@ app.patch('/api/ideas/:id/status', async (req, res) => {
   }
 })
 
-// Get all users (for testing)
+
 app.get('/api/users', async (req, res) => {
   try {
-    const users = await User.find({}, { password: 0 }) // Exclude password field
+    const [users] = await db.execute(
+      'SELECT id, fullName, phoneNumber, createdAt, updatedAt FROM users'
+    )
+
     res.json({
       success: true,
       users
@@ -308,6 +333,16 @@ app.get('/api/users', async (req, res) => {
   }
 })
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`)
+// Initialize database and start server
+async function startServer() {
+  await initializeDatabase()
+  
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`)
+  })
+}
+
+startServer().catch(err => {
+  console.error('Failed to start server:', err)
+  process.exit(1)
 })
